@@ -1,11 +1,11 @@
 import type { Config } from "@netlify/functions";
 import { getDatabase } from "@netlify/database";
 import { z } from "zod";
-import { isAuthorized } from "../../lib/auth";
+import { authenticateAdmin } from "../../lib/session";
+import { reply, readJson, validationFailed } from "../../lib/http";
 
 const RESERVED = new Set(["www", "api", "admin", "app", "mail"]);
 const SUBDOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
-const MAX_BODY_BYTES = 20_000;
 
 const SiteInput = z
   .object({
@@ -31,46 +31,28 @@ const SiteInput = z
   })
   .strict();
 
-const reply = (status: number, body: object) => Response.json(body, { status });
-
 export default async (req: Request) => {
-  if (req.method !== "POST") {
-    return Response.json(
+  if (req.method !== "POST")
+    return reply(
+      405,
       { success: false, message: "Method not allowed" },
-      { status: 405, headers: { Allow: "POST" } },
+      { Allow: "POST" },
     );
-  }
 
+  let admin;
   try {
-    if (!isAuthorized(req))
-      return reply(401, { success: false, message: "Unauthorized" });
+    admin = await authenticateAdmin(req);
   } catch (err) {
-    console.error(err);
-    return reply(500, { success: false, message: "Server misconfigured" });
+    console.error("session check failed", (err as Error).message);
+    return reply(500, { success: false, message: "Could not verify session" });
   }
+  if (!admin) return reply(401, { success: false, message: "Unauthorized" });
 
-  const raw = await req.text();
-  if (raw.length > MAX_BODY_BYTES)
-    return reply(413, { success: false, message: "Payload too large" });
+  const read = await readJson(req);
+  if (!read.ok) return read.res;
 
-  let body: unknown;
-  try {
-    body = JSON.parse(raw);
-  } catch {
-    return reply(400, { success: false, message: "Invalid JSON" });
-  }
-
-  const parsed = SiteInput.safeParse(body);
-  if (!parsed.success) {
-    return reply(400, {
-      success: false,
-      message: "Validation failed",
-      errors: parsed.error.issues.map((i) => ({
-        field: i.path.join("."),
-        message: i.message,
-      })),
-    });
-  }
+  const parsed = SiteInput.safeParse(read.body);
+  if (!parsed.success) return validationFailed(parsed.error.issues);
 
   const s = parsed.data;
   const customJs = s.customJs?.trim() ? s.customJs : null;
@@ -78,17 +60,16 @@ export default async (req: Request) => {
   try {
     const db = getDatabase();
     const rows = await db.sql<{ id: string }>`
-      INSERT INTO sites (subdomain, company_name, logo, title, description, custom_js)
-      VALUES (${s.subdomain}, ${s.companyName}, ${s.logo}, ${s.title}, ${s.description}, ${customJs})
+      INSERT INTO sites (subdomain, company_name, logo, title, description, custom_js, created_by)
+      VALUES (${s.subdomain}, ${s.companyName}, ${s.logo}, ${s.title}, ${s.description}, ${customJs}, ${admin.adminId})
       ON CONFLICT (subdomain) DO NOTHING
       RETURNING id`;
 
-    if (rows.length === 0) {
+    if (rows.length === 0)
       return reply(409, {
         success: false,
         message: "Subdomain already registered",
       });
-    }
 
     const root = process.env.PUBLIC_ROOT_DOMAIN ?? "example.com";
     return reply(201, {

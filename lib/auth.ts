@@ -13,3 +13,14 @@ export function isAuthorized(req: Request): boolean {
   const b = createHash("sha256").update(expected).digest();
   return timingSafeEqual(a, b);
 }
+
+export function getBearer(req: Request): string | null {
+  const m = (req.headers.get("authorization") ?? "").match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : null;
+}
+
+export const sha256 = (v: string) => createHash("sha256").update(v).digest();
+
+export function safeEqual(a: string, b: string): boolean {
+  return timingSafeEqual(sha256(a), sha256(b));
+}
